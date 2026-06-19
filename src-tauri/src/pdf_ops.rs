@@ -70,6 +70,7 @@ pub fn merge_pdfs_mem(files: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
     merged_doc.objects.insert(pages_id, Object::Dictionary(pages_dict));
     merged_doc.objects.insert(catalog_id, Object::Dictionary(catalog));
     merged_doc.trailer.set("Root", Object::Reference(catalog_id));
+    merged_doc.max_id = catalog_id.0;
 
     let mut output = Vec::new();
     merged_doc.save_to(&mut output).map_err(|e| e.to_string())?;
@@ -167,6 +168,7 @@ pub fn split_pdf_mem(input_pdf: &[u8], ranges: Vec<(u32, u32)>) -> Result<Vec<Ve
         new_doc.objects.insert(catalog_id, Object::Dictionary(new_catalog));
         new_doc.objects.insert(pages_id, Object::Dictionary(new_pages_dict));
         new_doc.trailer.set("Root", Object::Reference(catalog_id));
+        new_doc.max_id = pages_id.0;
 
         // Update kids Parent field to point to split pages node
         for kid in &kids {

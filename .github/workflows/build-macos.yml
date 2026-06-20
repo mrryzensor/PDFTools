@@ -1,0 +1,41 @@
+name: Build macOS
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            artifact: intel
+            swift-target: x86_64-apple-macosx10.15
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            artifact: apple-silicon
+            swift-target: arm64-apple-macosx11.0
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: npm ci
+      - name: Compile Apple Vision OCR helper
+        run: |
+          swiftc -O -target ${{ matrix.swift-target }} -framework Vision -framework AppKit src-tauri/native/macos/precision-pdf-ocr.swift -o src-tauri/bin/precision-pdf-ocr
+          chmod +x src-tauri/bin/precision-pdf-ocr
+      - name: Build app and DMG
+        run: npm run tauri build -- --target ${{ matrix.target }} --bundles app,dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: precision-pdf-macos-${{ matrix.artifact }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg

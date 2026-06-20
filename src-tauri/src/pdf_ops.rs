@@ -79,110 +79,67 @@ pub fn merge_pdfs_mem(files: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
 
 pub fn compress_pdf_mem(input_pdf: &[u8], quality: u8) -> Result<Vec<u8>, String> {
     let mut doc = Document::load_mem(input_pdf).map_err(|e| e.to_string())?;
-    
-    let image_ids: Vec<ObjectId> = doc.objects.iter()
-        .filter(|(_, obj)| {
-            if let Ok(dict) = obj.as_dict() {
-                if let Ok(subtype) = dict.get(b"Subtype") {
-                    if let Ok(name) = subtype.as_name() {
-                        return name == b"Image";
-                    }
-                }
-            }
-            false
-        })
-        .map(|(&id, _)| id)
-        .collect();
-
+    let image_ids: Vec<ObjectId> = doc.objects.iter().filter_map(|(&id, obj)| {
+        let dict = obj.as_stream().ok().map(|s| &s.dict)?;
+        (dict.get(b"Subtype").ok()?.as_name().ok()? == b"Image").then_some(id)
+    }).collect();
+    let mut changed = 0usize;
     for id in image_ids {
-        if let Some(Object::Stream(ref mut stream)) = doc.objects.get_mut(&id) {
-            if let Ok(data) = stream.decompressed_content() {
-                if let Ok(img) = image::load_from_memory(&data) {
-                    let mut compressed_data = Vec::new();
-                    let mut cursor = std::io::Cursor::new(&mut compressed_data);
-                    
-                    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
-                    if encoder.encode_image(&img).is_ok() {
-                        stream.set_content(compressed_data);
-                        stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
-                        stream.dict.set("Length", Object::Integer(stream.content.len() as i64));
-                    }
-                }
-            }
+        let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) else { continue };
+        let width = stream.dict.get(b"Width").ok().and_then(|v| v.as_i64().ok()).unwrap_or(0) as u32;
+        let height = stream.dict.get(b"Height").ok().and_then(|v| v.as_i64().ok()).unwrap_or(0) as u32;
+        let bits = stream.dict.get(b"BitsPerComponent").ok().and_then(|v| v.as_i64().ok()).unwrap_or(8);
+        if width == 0 || height == 0 || bits != 8 { continue; }
+        let colors = stream.dict.get(b"ColorSpace").ok().and_then(|v| v.as_name().ok()).unwrap_or(b"");
+        let raw = match stream.decompressed_content() { Ok(v) => v, Err(_) => continue };
+        let image = if colors == b"DeviceRGB" && raw.len() >= (width*height*3) as usize {
+            image::RgbImage::from_raw(width, height, raw[..(width*height*3) as usize].to_vec()).map(image::DynamicImage::ImageRgb8)
+        } else if colors == b"DeviceGray" && raw.len() >= (width*height) as usize {
+            image::GrayImage::from_raw(width, height, raw[..(width*height) as usize].to_vec()).map(image::DynamicImage::ImageLuma8)
+        } else { None };
+        let Some(mut img) = image else { continue };
+        let scale = if quality < 45 { 0.55 } else if quality < 70 { 0.75 } else { 1.0 };
+        if scale < 1.0 && width > 1000 {
+            img = img.resize((width as f32*scale) as u32, (height as f32*scale) as u32, image::imageops::FilterType::Triangle);
         }
+        let mut jpeg = Vec::new();
+        if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality.clamp(10, 90)).encode_image(&img).is_err() { continue; }
+        if jpeg.len() >= stream.content.len() { continue; }
+        stream.content = jpeg;
+        stream.dict.set("Width", Object::Integer(img.width() as i64));
+        stream.dict.set("Height", Object::Integer(img.height() as i64));
+        stream.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+        stream.dict.set("BitsPerComponent", Object::Integer(8));
+        stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+        stream.dict.remove(b"DecodeParms");
+        stream.dict.set("Length", Object::Integer(stream.content.len() as i64));
+        changed += 1;
     }
-
+    doc.prune_objects();
+    doc.compress();
     let mut output = Vec::new();
     doc.save_to(&mut output).map_err(|e| e.to_string())?;
+    if changed == 0 { return Err("No se encontraron imágenes PDF compatibles para recomprimir. El archivo puede estar ya optimizado o usar un formato no compatible.".into()); }
     Ok(output)
 }
 
 pub fn split_pdf_mem(input_pdf: &[u8], ranges: Vec<(u32, u32)>) -> Result<Vec<Vec<u8>>, String> {
-    let doc = Document::load_mem(input_pdf).map_err(|e| e.to_string())?;
-    let mut created_docs = Vec::new();
-
-    for range in ranges.iter() {
-        let mut new_doc = Document::with_version("1.5");
-        let mut kids = Vec::new();
-        let mut max_id = 1;
-
-        let catalog = doc.catalog().map_err(|e| e.to_string())?;
-        let pages_ref = catalog.get(b"Pages").map_err(|e| e.to_string())?;
-        let pages_dict = doc.get_object(pages_ref.as_reference().map_err(|_| "Invalid pages reference".to_string())?)
-            .map_err(|e| e.to_string())?
-            .as_dict()
-            .map_err(|_| "Pages is not a dict".to_string())?;
-        let doc_kids = pages_dict.get(b"Kids").map_err(|e| e.to_string())?.as_array().map_err(|_| "Kids is not an array".to_string())?;
-
-        let start = (range.0.saturating_sub(1)) as usize;
-        let end = (range.1) as usize;
-
-        if start >= doc_kids.len() || start >= end {
-            continue;
-        }
-
-        let target_kids = &doc_kids[start..std::cmp::min(end, doc_kids.len())];
-        for kid in target_kids {
-            kids.push(kid.clone());
-        }
-
-        for (id, object) in doc.objects.clone() {
-            new_doc.objects.insert(id, object);
-            if id.0 >= max_id {
-                max_id = id.0 + 1;
-            }
-        }
-
-        let catalog_id = (max_id, 0);
-        let pages_id = (max_id + 1, 0);
-
-        let mut new_catalog = Dictionary::new();
-        new_catalog.set("Type", Object::Name("Catalog".as_bytes().to_vec()));
-        new_catalog.set("Pages", Object::Reference(pages_id));
-
-        let mut new_pages_dict = Dictionary::new();
-        new_pages_dict.set("Type", Object::Name("Pages".as_bytes().to_vec()));
-        new_pages_dict.set("Count", Object::Integer(kids.len() as i64));
-        new_pages_dict.set("Kids", Object::Array(kids.clone()));
-
-        new_doc.objects.insert(catalog_id, Object::Dictionary(new_catalog));
-        new_doc.objects.insert(pages_id, Object::Dictionary(new_pages_dict));
-        new_doc.trailer.set("Root", Object::Reference(catalog_id));
-        new_doc.max_id = pages_id.0;
-
-        // Update kids Parent field to point to split pages node
-        for kid in &kids {
-            if let Ok(kid_ref) = kid.as_reference() {
-                if let Some(Object::Dictionary(ref mut kid_dict)) = new_doc.objects.get_mut(&kid_ref) {
-                    kid_dict.set("Parent", Object::Reference(pages_id));
-                }
-            }
-        }
-
+    let source = Document::load_mem(input_pdf).map_err(|e| e.to_string())?;
+    let page_count = source.get_pages().len() as u32;
+    if ranges.is_empty() { return Err("Debes indicar al menos un rango de páginas.".into()); }
+    let mut results = Vec::new();
+    for (start, end) in ranges {
+        if start == 0 || end < start || end > page_count { return Err(format!("Rango inválido {start}-{end}. El PDF tiene {page_count} páginas.")); }
+        let mut doc = source.clone();
+        let remove: Vec<u32> = (1..=page_count).filter(|p| *p < start || *p > end).collect();
+        doc.delete_pages(&remove);
+        doc.prune_objects();
+        doc.renumber_objects();
+        doc.compress();
         let mut output = Vec::new();
-        new_doc.save_to(&mut output).map_err(|e| e.to_string())?;
-        created_docs.push(output);
+        doc.save_to(&mut output).map_err(|e| e.to_string())?;
+        results.push(output);
     }
-
-    Ok(created_docs)
+    Ok(results)
 }
+

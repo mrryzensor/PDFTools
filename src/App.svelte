@@ -24,7 +24,8 @@
     XCircle,
     Info,
     CheckCircle,
-    AlertTriangle
+    AlertTriangle,
+    Settings
   } from '@lucide/svelte';
   
   // Tauri API imports
@@ -47,7 +48,7 @@
   });
 
   // App Navigation & UI State
-  let activeTab = 'files'; // 'files', 'merge', 'split', 'compress', 'ocr'
+  let activeTab = 'files';
   let isDarkMode = true;
   
   function selectTab(tab) {
@@ -67,6 +68,12 @@
   let loadedPdfBytes = null;
   let loadedFileName = 'Ningún archivo seleccionado';
   let loadedFileSize = '0 KB';
+  let loadedFilePath = '';
+  let outputSameAsSource = true;
+  let outputFolder = '';
+  let outputPrefix = '';
+  let outputSuffix = '';
+  let ocrSuffix = '_ocr';
   
   // Toasts
   let toasts = [];
@@ -199,6 +206,32 @@
     };
   }
 
+  async function loadPdfBytes(bytes, name, path = '') {
+    loadedFileName = name;
+    loadedFilePath = path;
+    loadedFileSize = (bytes.length / (1024 * 1024)).toFixed(2) + ' MB';
+    loadedPdfBytes = bytes.slice();
+    const pdfjsLib = await import('pdfjs-dist');
+    pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
+    pdfDoc = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
+    pages = Array.from({ length: pdfDoc.numPages }, (_, i) => ({ id: i + 1, originalPageNum: i + 1, name: `Página ${i + 1}`, isOcrDone: false, rotation: 0 }));
+    splitEnd = pdfDoc.numPages;
+    showToast('PDF cargado correctamente', 'success');
+  }
+
+  async function choosePdfNative() {
+    if (!tauriAvailable || !invoke) return;
+    try {
+      const file = await invoke('select_pdf_file');
+      await loadPdfBytes(base64ToUint8(file.bytes_b64), file.name, file.path);
+    } catch (e) { if (!String(e).includes('cancelada')) showToast(String(e), 'error'); }
+  }
+
+  async function chooseOutputFolder() {
+    try { outputFolder = await invoke('choose_output_folder'); outputSameAsSource = false; }
+    catch (e) { if (!String(e).includes('cancelada')) showToast(String(e), 'error'); }
+  }
+
   async function handleFileSelect(event) {
     const file = event.target.files[0];
     if (!file) return;
@@ -213,7 +246,7 @@
     reader.onload = async (e) => {
       try {
         const arrayBuffer = e.target.result;
-        loadedPdfBytes = new Uint8Array(arrayBuffer);
+        loadedPdfBytes = new Uint8Array(arrayBuffer.slice(0));
 
         // Load PDF.js dynamically to render previews
         const pdfjsLib = await import('pdfjs-dist');
@@ -222,7 +255,7 @@
           import.meta.url
         ).toString();
 
-        const loadingTask = pdfjsLib.getDocument({ data: loadedPdfBytes });
+        const loadingTask = pdfjsLib.getDocument({ data: loadedPdfBytes.slice() });
         const pdf = await loadingTask.promise;
         pdfDoc = pdf;
         
@@ -270,6 +303,7 @@
   let isOcrRunning = false;
   let ocrResultText = "";
   let ocrPageTarget = null;
+
 
   // Merge tool state
   let mergeFiles = []; // Array of { name, size, bytes }
@@ -336,44 +370,66 @@
   }
 
   // Split tool state
+  let splitMode = "chunks";
   let splitRanges = "1-2";
+  let splitStart = 1;
+  let splitEnd = 1;
+  let splitChunkSize = 2;
   let splitStatus = "";
 
+  function normalizedSplitBounds() {
+    const max = Math.max(1, pages.length);
+    const start = Math.min(max, Math.max(1, Number(splitStart) || 1));
+    const end = Math.min(max, Math.max(start, Number(splitEnd) || start));
+    return { start, end };
+  }
+
+  function parseSplitRanges(value) {
+    if (!value.trim()) throw new Error('Agrega al menos un rango.');
+    return value.split(',').map(raw => {
+      const match = raw.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+      if (!match) throw new Error(`Rango inválido: "${raw.trim()}". Usa 1-3, 5, 8-10.`);
+      const start = Number(match[1]);
+      const end = Number(match[2] || match[1]);
+      if (start < 1 || end < start || end > pages.length) throw new Error(`El rango ${start}-${end} debe estar entre 1 y ${pages.length}.`);
+      return [start, end];
+    });
+  }
+
+  function getSplitRanges() {
+    const { start, end } = normalizedSplitBounds();
+    if (splitMode === 'custom') return parseSplitRanges(splitRanges);
+    if (splitMode === 'even') return Array.from({ length: end - start + 1 }, (_, i) => start + i).filter(p => p % 2 === 0).map(p => [p, p]);
+    if (splitMode === 'odd') return Array.from({ length: end - start + 1 }, (_, i) => start + i).filter(p => p % 2 === 1).map(p => [p, p]);
+    const size = Math.max(1, Number(splitChunkSize) || 1);
+    const result = [];
+    for (let page = start; page <= end; page += size) result.push([page, Math.min(end, page + size - 1)]);
+    return result;
+  }
+
+  function splitRangeLabel(range) {
+    return range[0] === range[1] ? `Página ${range[0]}` : `Páginas ${range[0]}–${range[1]}`;
+  }
+
+  function getSplitPreview() {
+    try { return getSplitRanges(); } catch { return []; }
+  }
+
   async function handleSplit() {
-    if (!loadedPdfBytes) {
-      showToast('Por favor, carga un PDF primero.', 'warning');
-      return;
-    }
-    
+    if (!loadedPdfBytes) { showToast('Por favor, carga un PDF primero.', 'warning'); return; }
     isProcessingFile = true;
     showToast('Dividiendo PDF...', 'info');
-    
     try {
-      await new Promise(r => setTimeout(r, 100));
-      const parsedRanges = splitRanges.split(',').map(r => {
-        const parts = r.trim().split('-');
-        return [parseInt(parts[0]), parseInt(parts[1])];
-      });
-
+      const parsedRanges = getSplitRanges();
+      if (!parsedRanges.length) throw new Error('El criterio seleccionado no incluye ninguna página.');
       if (tauriAvailable && invoke) {
-        const inputB64 = uint8ToBase64(loadedPdfBytes);
-        const splitResultsB64 = await invoke('split_pdf_file', { 
-          inputB64: inputB64, 
-          ranges: parsedRanges 
-        });
-        
+        const splitResultsB64 = await invoke('split_pdf_file', { inputB64: uint8ToBase64(loadedPdfBytes), ranges: parsedRanges });
         for (let i = 0; i < splitResultsB64.length; i++) {
-          const bytes = base64ToUint8(splitResultsB64[i]);
-          await downloadPdfBlob(bytes, `split_part_${i+1}.pdf`);
+          await downloadPdfBlob(base64ToUint8(splitResultsB64[i]), `parte_${i + 1}_paginas_${parsedRanges[i][0]}-${parsedRanges[i][1]}.pdf`);
         }
-      } else {
-        await downloadPdfBlob(loadedPdfBytes, `split_part_1.pdf`);
-      }
-    } catch (err) {
-      showToast('Error al dividir: ' + err, 'error');
-    } finally {
-      isProcessingFile = false;
-    }
+      } else await downloadPdfBlob(loadedPdfBytes, 'parte_1.pdf');
+    } catch (err) { showToast('Error al dividir: ' + err, 'error'); }
+    finally { isProcessingFile = false; }
   }
 
   // Compression tool state
@@ -415,49 +471,75 @@
   }
 
   // Native OCR Trigger
-  function runOcr(pageId) {
-    if (isOcrRunning) return;
-    ocrPageTarget = pageId;
-    isOcrRunning = true;
-    ocrProgress = 0;
-    
-    const interval = setInterval(async () => {
-      if (ocrProgress < 100) {
-        ocrProgress += 10;
-      } else {
-        clearInterval(interval);
-        isOcrRunning = false;
-        
-        const targetPage = pages.find(p => p.id === pageId);
-        if (targetPage) {
-          targetPage.isOcrDone = true;
-          ocrResultText = `[OCR] Texto reconocido en Página ${pageId}:\n\n` + targetPage.content;
-          pages = [...pages];
-        }
+  async function renderPageForOcr(pageNumber) {
+    const pdfPage = await pdfDoc.getPage(pageNumber);
+    const viewport = pdfPage.getViewport({ scale: 2.5 });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+    return canvas.toDataURL('image/png').split(',')[1];
+  }
 
-        if (tauriAvailable && invoke) {
-          try {
-            // Mock empty bytes for OCR trigger in this layout
-            const text = await invoke('perform_ocr', { imageB64: "" });
-            ocrResultText = text;
-          } catch (e) {
-            console.error("Native OCR run finished.", e);
-          }
-        }
-        showToast('OCR de página finalizado', 'success');
+  async function runOcr(pageId) {
+    if (isOcrRunning || !pdfDoc) return;
+    isOcrRunning = true; ocrPageTarget = pageId; ocrProgress = 15;
+    try {
+      if (!tauriAvailable || !invoke) throw new Error('El OCR requiere la aplicación de escritorio.');
+      const target = pages.find(p => p.id === pageId);
+      const imageB64 = await renderPageForOcr(target.originalPageNum);
+      ocrProgress = 60;
+      const rawResult = await invoke('perform_ocr', { imageB64 });
+      const result = JSON.parse(rawResult);
+      target.isOcrDone = true;
+      target.ocrData = result;
+      ocrResultText = result.text;
+      pages = [...pages]; ocrProgress = 100;
+      showToast('Texto reconocido correctamente', 'success');
+    } catch (e) { showToast('Error OCR: ' + e, 'error'); }
+    finally { isOcrRunning = false; }
+  }
+
+  async function runBatchOcr() {
+    if (!loadedPdfBytes || !pdfDoc || isOcrRunning) return;
+    isOcrRunning = true; ocrResultText = '';
+    try {
+      for (let i = 0; i < pages.length; i++) {
+        ocrPageTarget = pages[i].id;
+        ocrProgress = Math.round((i / pages.length) * 100);
+        const raw = await invoke('perform_ocr', { imageB64: await renderPageForOcr(pages[i].originalPageNum) });
+        pages[i].ocrData = JSON.parse(raw); pages[i].isOcrDone = true;
+        ocrResultText += `${pages[i].name}\n${pages[i].ocrData.text}\n\n`;
+        pages = [...pages];
       }
-    }, 100);
+      const { PDFDocument, StandardFonts, rgb } = await import('pdf-lib');
+      const doc = await PDFDocument.load(loadedPdfBytes.slice());
+      const font = await doc.embedFont(StandardFonts.Helvetica);
+      const pdfPages = doc.getPages();
+      for (const item of pages) {
+        const page = pdfPages[item.originalPageNum - 1]; const size = page.getSize();
+        const sx = size.width / item.ocrData.width; const sy = size.height / item.ocrData.height;
+        for (const word of item.ocrData.words) if (word.text) page.drawText(word.text, { x: word.x*sx, y: size.height-(word.y+word.height)*sy, size: Math.max(4,word.height*sy*.82), font, color: rgb(0,0,0), opacity: 0 });
+      }
+      const base = loadedFileName.replace(/\.pdf$/i,'');
+      await downloadPdfBlob(await doc.save({ useObjectStreams: true }), `${base}${ocrSuffix || '_ocr'}.pdf`, true);
+      showToast('OCR terminado y PDF creado', 'success');
+    } catch (e) { showToast('Error OCR: ' + e, 'error'); }
+    finally { isOcrRunning = false; ocrProgress = 100; }
   }
 
   // Helper to trigger browser downloads or native save dialogs
-  async function downloadPdfBlob(bytes, filename) {
+  async function downloadPdfBlob(bytes, filename, preserveOcrName = false) {
     if (tauriAvailable && invoke) {
       try {
         const bytesB64 = uint8ToBase64(bytes);
-        const savedPath = await invoke('save_pdf_dialog', { 
-          bytesB64: bytesB64, 
-          defaultName: filename 
-        });
+        const dot = filename.toLowerCase().endsWith('.pdf') ? filename.slice(0, -4) : filename;
+        const finalName = preserveOcrName ? filename : `${outputPrefix}${dot}${outputSuffix}.pdf`;
+        const sourceFolder = loadedFilePath ? loadedFilePath.replace(/[\/][^\/]+$/, '') : '';
+        const targetFolder = outputSameAsSource ? sourceFolder : outputFolder;
+        const savedPath = targetFolder
+          ? await invoke('save_pdf_to_folder', { bytesB64, filename: finalName, folder: targetFolder })
+          : await invoke('save_pdf_dialog', { bytesB64, defaultName: finalName });
         showFileToast(`Guardado: ${savedPath.split('\\').pop()}`, savedPath);
       } catch (err) {
         if (err !== "Operación cancelada") {
@@ -681,6 +763,7 @@
           <ScanText class="w-5 h-5" />
           <span class="text-sm font-semibold">OCR por lotes</span>
         </button>
+        <button on:click={() => selectTab('settings')} class="w-full flex items-center gap-3 px-4 py-3 rounded-xl {activeTab === 'settings' ? 'bg-indigo-600/20 text-indigo-400 border border-indigo-500/20' : 'text-slate-400 hover:bg-white/5'}"><Settings class="w-5 h-5" /><span class="text-sm font-semibold">Configuración</span></button>
       </nav>
     </div>
 
@@ -898,38 +981,33 @@
         <div class="max-w-2xl w-full glass-effect rounded-2xl p-8 space-y-6">
           <div class="flex items-center gap-3 border-b border-white/5 pb-4">
             <Scissors class="w-6 h-6 text-indigo-400" />
-            <div>
-              <h3 class="text-lg font-bold">Dividir Archivo PDF</h3>
-              <p class="text-xs text-slate-400">Extrae rangos de páginas del documento cargado.</p>
-            </div>
+            <div><h3 class="text-lg font-bold">Dividir archivo PDF</h3><p class="text-xs text-slate-400">Elige c?mo quieres crear los archivos nuevos.</p></div>
           </div>
-
-          <div class="space-y-4">
-            <div>
-              <label for="split-ranges-input" class="block text-xs font-bold text-slate-400 uppercase mb-2">Rangos de Páginas</label>
-              <input 
-                id="split-ranges-input"
-                type="text" 
-                bind:value={splitRanges}
-                class="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:border-indigo-500 outline-none text-white font-mono"
-                placeholder="Ej. 1-2, 3-4"
-              />
-              <span class="text-[10px] text-slate-500 mt-1 block">Separa los rangos con comas para generar múltiples archivos de salida.</span>
-            </div>
-            
-            {#if splitStatus}
-              <div class="p-3 bg-indigo-500/10 border border-indigo-500/20 rounded-lg text-xs text-indigo-400">
-                {splitStatus}
-              </div>
-            {/if}
-
-            <button 
-              on:click={handleSplit}
-              class="w-full py-3 text-sm font-bold bg-indigo-600 hover:bg-indigo-500 rounded-xl shadow-lg active:scale-95 transition-all text-white cursor-pointer"
-            >
-              Dividir Documento
-            </button>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {#each [['chunks','Cada X páginas'],['even','Páginas pares'],['odd','Páginas impares'],['custom','Rangos manuales']] as option}
+              <button on:click={() => splitMode = option[0]} class="p-3 rounded-xl text-xs font-bold border transition-all {splitMode === option[0] ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-white/[0.03] border-white/10 text-slate-400'}">{option[1]}</button>
+            {/each}
           </div>
+          {#if splitMode !== 'custom'}
+            <div class="p-4 bg-white/[0.03] border border-white/10 rounded-xl space-y-4">
+              <div class="flex justify-between text-xs font-bold"><span>Empezar en la página {splitStart}</span><span>Terminar en la página {splitEnd}</span></div>
+              <input aria-label="Página inicial" type="range" min="1" max={Math.max(1,pages.length)} bind:value={splitStart} class="w-full accent-indigo-500" />
+              <input aria-label="Página final" type="range" min="1" max={Math.max(1,pages.length)} bind:value={splitEnd} class="w-full accent-emerald-500" />
+              {#if splitMode === 'chunks'}
+                <label class="block text-xs font-bold text-slate-300">Crear un archivo por cada
+                  <input type="number" min="1" max={Math.max(1,pages.length)} bind:value={splitChunkSize} class="mx-2 w-20 bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-center" /> páginas
+                </label>
+              {/if}
+            </div>
+          {:else}
+            <div><label for="split-ranges-input" class="block text-xs font-bold text-slate-400 uppercase mb-2">Rangos separados por comas</label><input id="split-ranges-input" bind:value={splitRanges} class="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm text-white font-mono" placeholder="Ejemplo: 1-3, 5, 8-10" /></div>
+          {/if}
+          <div class="p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-xl">
+            <p class="text-xs font-bold text-indigo-300 mb-2">Vista previa</p>
+            <p class="text-xs text-slate-300">Se crearán {getSplitPreview().length} archivo{getSplitPreview().length === 1 ? '' : 's'}:</p>
+            <div class="flex flex-wrap gap-2 mt-3">{#each getSplitPreview().slice(0, 12) as range}<span class="px-2 py-1 bg-white/5 rounded text-[11px]">{splitRangeLabel(range)}</span>{/each}{#if getSplitPreview().length > 12}<span class="text-[11px] text-slate-500">y {getSplitPreview().length - 12} más…</span>{/if}</div>
+          </div>
+          <button on:click={handleSplit} class="w-full py-3 text-sm font-bold bg-indigo-600 hover:bg-indigo-500 rounded-xl text-white">Crear {getSplitPreview().length} archivo{getSplitPreview().length === 1 ? '' : 's'}</button>
         </div>
 
       <!-- TAB 4: COMPRESS -->
@@ -1002,6 +1080,7 @@
               </div>
             </div>
 
+            <div class="space-y-3"><label class="block text-xs font-bold text-slate-400">Sufijo del PDF OCR</label><input bind:value={ocrSuffix} class="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3" /><button on:click={runBatchOcr} disabled={isOcrRunning || !loadedPdfBytes} class="w-full py-3 bg-indigo-600 rounded-xl font-bold disabled:opacity-40">{isOcrRunning ? `Procesando ${ocrProgress}%` : 'Crear PDF con OCR'}</button></div>
             <div class="space-y-4">
               <div class="p-4 bg-white/[0.02] border border-white/5 rounded-xl">
                 <h4 class="text-xs font-bold text-slate-400 uppercase mb-3">Páginas de Documento</h4>
@@ -1041,6 +1120,14 @@
               bind:value={ocrResultText}
             ></textarea>
           </div>
+        </div>
+      {:else if activeTab === 'settings'}
+        <div class="max-w-2xl w-full glass-effect rounded-2xl p-8 space-y-6">
+          <div class="flex items-center gap-3 border-b border-white/5 pb-4"><Settings class="w-6 h-6 text-indigo-400" /><div><h3 class="text-lg font-bold">Configuración global</h3><p class="text-xs text-slate-400">Define dónde y con qué nombre se guardan los PDF.</p></div></div>
+          <label class="flex gap-3 items-center p-4 bg-white/[0.03] rounded-xl"><input type="checkbox" bind:checked={outputSameAsSource} class="accent-indigo-500" /><span class="text-sm">Guardar en la misma carpeta del PDF original</span></label>
+          {#if !outputSameAsSource}<div class="flex gap-2"><input readonly value={outputFolder || 'Ninguna carpeta seleccionada'} class="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 text-sm" /><button on:click={chooseOutputFolder} class="px-4 py-3 bg-indigo-600 rounded-xl text-sm font-bold">Elegir carpeta</button></div>{/if}
+          <div class="grid grid-cols-2 gap-4"><label class="text-xs font-bold text-slate-400">Prefijo global<input bind:value={outputPrefix} placeholder="Ej. procesado_" class="mt-2 w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white" /></label><label class="text-xs font-bold text-slate-400">Sufijo global<input bind:value={outputSuffix} placeholder="Ej. _final" class="mt-2 w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white" /></label></div>
+          <p class="text-xs text-slate-500">El OCR usa su sufijo espec?fico <strong>{ocrSuffix}</strong>. Las dem?s herramientas usan el prefijo y sufijo globales.</p>
         </div>
       {/if}
 

@@ -707,7 +707,7 @@
     <div>
       <div class="mb-10 px-4 flex items-center justify-between">
         <div>
-          <h1 class="text-xl font-bold tracking-tight bg-gradient-to-r from-indigo-400 to-emerald-400 bg-clip-text text-transparent">Precision PDF</h1>
+          <h1 class="text-xl font-bold tracking-tight bg-gradient-to-r from-orange-400 to-amber-200 bg-clip-text text-transparent">PDF Tools</h1>
           <p class="text-[10px] uppercase tracking-wider text-slate-400">Desktop Suite</p>
         </div>
         <button 
@@ -769,7 +769,7 @@
 
     <!-- User & Version Profile Card -->
     <div class="px-4 py-3 rounded-xl border border-white/5 bg-white/[0.02] flex items-center gap-3">
-      <div class="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-emerald-500 flex items-center justify-center font-bold text-sm text-white">
+      <div class="w-9 h-9 rounded-full bg-gradient-to-tr from-orange-500 to-amber-400 flex items-center justify-center font-bold text-sm text-white">
         DR
       </div>
       <div class="overflow-hidden">
